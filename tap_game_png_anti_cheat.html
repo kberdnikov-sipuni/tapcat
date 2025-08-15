@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Тап по PNG (анти-чит)</title>
+<style>
+  :root{ --bg:#0b0f17; --panel:#121826; --text:#e7eef7; --accent:#6ee7b7; --warn:#f59e0b; --bad:#ef4444; --good:#22c55e;}
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:linear-gradient(180deg,#121826,#0b0f17);color:var(--text);font:16px/1.4 system-ui, -apple-system, Segoe UI, Roboto}
+  .wrap{max-width:960px;margin:0 auto;padding:16px 16px 32px;}
+  .topbar{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px}
+  .card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+  #arena{position:relative;width:100%;aspect-ratio:16/9;min-height:360px;overflow:hidden}
+  canvas{position:absolute;inset:0;width:100%;height:100%}
+  .hud{display:flex;gap:12px;flex-wrap:wrap;padding:12px 14px;align-items:center}
+  .pill{padding:8px 12px;border-radius:999px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1)}
+  .pill.warn{background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.35)}
+  .pill.bad{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.35)}
+  .btn{appearance:none;border:none;border-radius:12px;padding:10px 14px;color:#0b0f17;background:var(--accent);font-weight:700;cursor:pointer}
+  .log{padding:12px;max-height:180px;overflow:auto;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;background:rgba(0,0,0,.25);border-radius:12px;border:1px solid rgba(255,255,255,.08)}
+  .caption{opacity:.85}
+  dialog{border:none;border-radius:16px;padding:0;max-width:420px;width:calc(100% - 32px);background:var(--panel);color:var(--text)}
+  dialog::backdrop{background:rgba(0,0,0,.6)}
+  .modal{padding:16px}
+  .captcha-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .kbd{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;background:rgba(255,255,255,.08);padding:2px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.16)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div style="display:flex;gap:10px;align-items:center">
+      <div style="width:36px;height:36px;border-radius:8px;background:radial-gradient(circle at 35% 35%, #d1fae5, #10b981 65%, #065f46);border:1px solid rgba(255,255,255,.35)"></div>
+      <div>
+        <div style="font-weight:800">BVKot Tap — PNG</div>
+        <div class="caption">Кликать нужно по самой картинке (прозрачные пиксели не засчитываются)</div>
+      </div>
+    </div>
+    <button class="btn" id="resetBtn">Сбросить</button>
+  </div>
+
+  <div id="arena" class="card">
+    <canvas id="canvas" width="1280" height="720"></canvas>
+  </div>
+
+  <div class="hud card">
+    <div class="pill"><b>Коины:</b> <span id="coins">0</span></div>
+    <div class="pill"><b>Успешные тапы:</b> <span id="taps">0</span></div>
+    <div class="pill warn" id="suspPill" style="display:none"><b>Подозрительность:</b> <span id="susLevel">0</span>%</div>
+    <div class="pill bad" id="lockPill" style="display:none"><b>Блок:</b> <span id="lockLeft">0</span>с</div>
+  </div>
+
+  <details class="card" style="padding:8px 12px">
+    <summary>Как работает защита</summary>
+    <ul>
+      <li>Засчитываем только клики по непрозрачным пикселям PNG.</li>
+      <li>Минимальный интервал — <span class="kbd">140мс</span>.</li>
+      <li>Если ≥70% из последних 10 кликов — в одной точке (±3px), отклоняем.</li>
+      <li>Слишком ровный ритм (низкая σ интервалов) повышает «подозрительность».</li>
+    </ul>
+  </details>
+
+  <div class="card" style="margin-top:12px">
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<dialog id="captcha">
+  <div class="modal">
+    <h3>Проверка: вы человек?</h3>
+    <p>Нажмите: <b id="needLbl"></b> (5 секунд).</p>
+    <div class="captcha-grid">
+      <button class="btn" id="optA"></button>
+      <button class="btn" id="optB"></button>
+    </div>
+  </div>
+</dialog>
+
+<script>
+(function(){
+  const imgSrc = 'cat_tap.png'; // локальный файл рядом
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const arena = document.getElementById('arena');
+
+  const coinsEl = document.getElementById('coins');
+  const tapsEl = document.getElementById('taps');
+  const logEl = document.getElementById('log');
+  const suspPill = document.getElementById('suspPill');
+  const susLevelEl = document.getElementById('susLevel');
+  const lockPill = document.getElementById('lockPill');
+  const lockLeftEl = document.getElementById('lockLeft');
+
+  const state = {
+    coins: 0,
+    taps: 0,
+    lastTime: 0,
+    clicks: [],
+    minInterval: 140,
+    sameSpotTolerance: 3,
+    sameSpotThreshold: 0.7,
+    windowN: 10,
+    suspicion: 0,
+    lockUntil: 0,
+    imgRect: {x:0,y:0,w:0,h:0}, // позиция картинки на канвасе
+    pixelData: null
+  };
+
+  function log(m){ const t=new Date().toLocaleTimeString(); logEl.innerHTML = `<div>[${t}] ${m}</div>` + logEl.innerHTML; }
+  function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+
+  // Загрузка прогресса
+  try{
+    const saved = JSON.parse(localStorage.getItem('tap-demo-png')||'{}');
+    if(saved && typeof saved.coins==='number'){ state.coins=saved.coins; state.taps=saved.taps||0; }
+  }catch(e){}
+  coinsEl.textContent = state.coins; tapsEl.textContent = state.taps;
+
+  // Рисуем изображение по центру (без смещения в будущем)
+  const img = new Image();
+  img.src = imgSrc + '?v=' + Date.now(); // против кэша при локальном открытии
+
+  function fit(){
+    const r = arena.getBoundingClientRect();
+    canvas.width = Math.round(r.width*devicePixelRatio);
+    canvas.height = Math.round(r.height*devicePixelRatio);
+    canvas.style.width = r.width+'px';
+    canvas.style.height = r.height+'px';
+    ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+    draw();
+  }
+  new ResizeObserver(fit).observe(arena);
+
+  function draw(){
+    if(!img.complete) return;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    // вписываем, сохраняя пропорции, без обрезки
+    const cw = canvas.width/devicePixelRatio, ch = canvas.height/devicePixelRatio;
+    const iw = img.width, ih = img.height;
+    const scale = Math.min(cw/iw, ch/ih) * 0.9; // немножко отступов
+    const w = iw*scale, h = ih*scale;
+    const x = (cw - w)/2, y = (ch - h)/2;
+    state.imgRect = {x,y,w,h};
+    ctx.drawImage(img, x, y, w, h);
+    // сохраним пиксели для проверки альфы
+    try{
+      const data = ctx.getImageData(x, y, w, h);
+      state.pixelData = data;
+    }catch(e){
+      state.pixelData = null;
+    }
+  }
+
+  img.onload = ()=>{ fit(); draw(); };
+
+  // Проверка: клик по непустому пикселю?
+  function isOnOpaquePixel(x,y){
+    const r = state.imgRect;
+    if(x<r.x || y<r.y || x>r.x+r.w || y>r.y+r.h) return false;
+    if(!state.pixelData) return true; // на случай безопасности CORS, но локально ок
+    const relX = Math.floor((x - r.x));
+    const relY = Math.floor((y - r.y));
+    const idx = (relY * state.pixelData.width + relX) * 4 + 3; // альфа
+    const alpha = state.pixelData.data[idx];
+    return alpha > 10; // порог прозрачности
+  }
+
+  function pushClick(x,y,t){
+    state.clicks.push({x,y,t});
+    if(state.clicks.length>50) state.clicks.shift();
+  }
+  function sameSpotRatio(){
+    const N = Math.min(state.windowN, state.clicks.length);
+    if(N<=1) return 0;
+    const last = state.clicks[state.clicks.length-1];
+    let same=0;
+    for(let i=state.clicks.length-N;i<state.clicks.length;i++){
+      const c = state.clicks[i];
+      const dx=c.x-last.x, dy=c.y-last.y;
+      if(Math.hypot(dx,dy)<=state.sameSpotTolerance) same++;
+    }
+    return same/N;
+  }
+  function intervalStats(){
+    const N = Math.min(state.windowN, state.clicks.length);
+    if(N<=2) return {avg:0,std:0};
+    const arr=[];
+    for(let i=state.clicks.length-N+1;i<state.clicks.length;i++){
+      arr.push(state.clicks[i].t-state.clicks[i-1].t);
+    }
+    const avg = arr.reduce((a,b)=>a+b,0)/arr.length;
+    const std = Math.sqrt(arr.reduce((s,v)=>s+Math.pow(v-avg,2),0)/arr.length);
+    return {avg,std};
+  }
+  function raiseSuspicion(a, reason){
+    state.suspicion = clamp(state.suspicion + a, 0, 100);
+    susLevelEl.textContent = Math.round(state.suspicion);
+    if(state.suspicion>0) suspPill.style.display='inline-flex';
+    if(reason) log(`<span style="color:#f59e0b">Подозрительно:</span> ${reason} (+${a})`);
+    if(state.suspicion>=60 && !document.getElementById('captcha').open) showCaptcha();
+  }
+  function decay(){ state.suspicion = clamp(state.suspicion - 0.5, 0, 100); susLevelEl.textContent = Math.round(state.suspicion); if(state.suspicion<=0) suspPill.style.display='none'; requestAnimationFrame(decay); }
+  requestAnimationFrame(decay);
+
+  function lock(seconds){
+    state.lockUntil = Date.now()+seconds*1000;
+    lockPill.style.display='inline-flex';
+    tickLock();
+  }
+  function tickLock(){
+    const left = Math.max(0, Math.ceil((state.lockUntil - Date.now())/1000));
+    lockLeftEl.textContent = left;
+    if(left<=0){ lockPill.style.display='none'; return; }
+    setTimeout(tickLock, 250);
+  }
+
+  // Капча
+  const dlg = document.getElementById('captcha');
+  const optA = document.getElementById('optA');
+  const optB = document.getElementById('optB');
+  const needLbl = document.getElementById('needLbl');
+  let captchaTimer=0, need='';
+  function showCaptcha(){
+    const choices = ['кот','пёс','луна','сыр','мёд','снег'];
+    let a = choices[Math.floor(Math.random()*choices.length)];
+    let b = choices[Math.floor(Math.random()*choices.length)];
+    while(b===a) b = choices[Math.floor(Math.random()*choices.length)];
+    if(Math.random()<.5){ optA.textContent=a; optB.textContent=b; } else { optA.textContent=b; optB.textContent=a; }
+    need = Math.random()<.5? optA.textContent : optB.textContent;
+    needLbl.textContent = need;
+    dlg.showModal();
+    clearTimeout(captchaTimer);
+    captchaTimer = setTimeout(()=>{ dlg.close(); raiseSuspicion(15,'капча не пройдена'); lock(10); }, 5000);
+  }
+  function solveCaptcha(label){
+    clearTimeout(captchaTimer);
+    if(label===need){ state.suspicion = clamp(state.suspicion - 25, 0, 100); susLevelEl.textContent=Math.round(state.suspicion); log('<span style="color:#22c55e">Капча пройдена</span>'); }
+    else { raiseSuspicion(20,'неверный ответ'); lock(12); }
+    dlg.close();
+  }
+  document.getElementById('optA').onclick=()=>solveCaptcha(optA.textContent);
+  document.getElementById('optB').onclick=()=>solveCaptcha(optB.textContent);
+
+  // Обработка кликов
+  function handleTap(ev){
+    ev.preventDefault();
+    const now = Date.now();
+    if(now < state.lockUntil) { log('<span class="muted">Блокировка активна</span>'); return; }
+
+    const rect = canvas.getBoundingClientRect();
+    const x = (ev.clientX ?? (ev.touches && ev.touches[0].clientX)) - rect.left;
+    const y = (ev.clientY ?? (ev.touches && ev.touches[0].clientY)) - rect.top;
+
+    // минимальный интервал
+    if(state.lastTime && (now - state.lastTime) < state.minInterval){
+      raiseSuspicion(2, `слишком быстрый клик (${now - state.lastTime}мс)`);
+      return;
+    }
+    state.lastTime = now;
+
+    // должно быть по непрозрачному пикселю картинки
+    if(!isOnOpaquePixel(x,y)){
+      raiseSuspicion(0.5, 'клик вне картинки/по прозрачности');
+      return;
+    }
+
+    // анти-одна-точка
+    state.clicks.push({x,y,t:now});
+    if(state.clicks.length>50) state.clicks.shift();
+    const ratio = sameSpotRatio();
+    if(ratio >= state.sameSpotThreshold){
+      raiseSuspicion(5, `клики в одной точке (${Math.round(ratio*100)}%)`);
+      return; // не засчитываем
+    }
+
+    // ритм
+    const {std} = intervalStats();
+    if(std && std < 8) raiseSuspicion(3, `слишком ровный ритм (σ=${std.toFixed(1)}мс)`);
+
+    // засчитываем
+    state.coins += 1;
+    state.taps += 1;
+    coinsEl.textContent = state.coins;
+    tapsEl.textContent = state.taps;
+    localStorage.setItem('tap-demo-png', JSON.stringify({coins:state.coins,taps:state.taps}));
+    log(`<span style="color:#6ee7b7">+1 коин</span> | (${Math.round(x)},${Math.round(y)})`);
+  }
+
+  canvas.addEventListener('mousedown', handleTap);
+  canvas.addEventListener('touchstart', handleTap, {passive:false});
+
+  // Сброс
+  document.getElementById('resetBtn').onclick = () => {
+    state.coins = 0; state.taps = 0; coinsEl.textContent=0; tapsEl.textContent=0;
+    state.suspicion = 0; suspPill.style.display='none'; susLevelEl.textContent=0;
+    localStorage.removeItem('tap-demo-png');
+    log('Прогресс сброшен.');
+  };
+})();
+</script>
+</body>
+</html>
